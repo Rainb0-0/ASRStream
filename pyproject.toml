@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iptv-asr-pipeline"
+version = "0.1.0"
+description = "Configurable real-time IPTV transcription pipeline"
+requires-python = ">=3.11"
+dependencies = [
+  "faster-whisper>=1.1,<2",
+  "numpy>=1.26,<3",
+]
+
+[project.scripts]
+asr-pipeline = "asr_pipeline.cli:main"
+asr-poc = "asr_pipeline.poc_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+asr_pipeline = ["web/*.html", "web/*.js"]

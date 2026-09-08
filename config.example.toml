@@ -1,0 +1,50 @@
+# Copy outside the source tree and set deployment-specific paths/URLs there.
+
+[model]
+# Large-v3 is intentionally fixed by this pipeline.
+model_path = "./models/faster-whisper-large-v3"
+device = "cuda"                # use "cpu" when no NVIDIA driver is available
+device_index = 0                # CUDA device, ignored on CPU
+compute_type = "float16"       # "int8" is the practical CPU setting
+cpu_threads = 5                 # CTranslate2 threads in each CPU worker
+beam_size = 2
+vad_filter = true
+
+[workers]
+# The service creates the smallest number of model processes that its benchmark
+# permits, never exceeding this value.
+max_workers = 4
+# Optional CPU affinity sets, one per possible worker. Omit for OS scheduling.
+# core_sets = [[0, 1], [2, 3]]
+
+[benchmark]
+audio_path = "./assets/benchmark-iribtv1-30s.wav"
+
+[audio]
+ffmpeg_path = "ffmpeg"
+sample_rate = 16000
+window_seconds = 5.0
+reconnect_initial_seconds = 1.0
+reconnect_max_seconds = 30.0
+
+[sink]
+type = "stdout_ndjson"
+
+[poc]
+# The tunnel must be running before starting the local proof of concept.
+bind_host = "127.0.0.1"
+port = 8080
+channel_api = "http://192.168.1.79/s/data/data.php"
+credentials_env = "/home/rainb0-0/.config/company-access/credentials.env"
+username_variable = "IPTV_CLIENT_UI_USER"
+password_variable = "IPTV_CLIENT_UI_PASSWORD"
+# Dedicated directory that may be cleared whenever the selected channel changes.
+media_directory = "./.runtime/poc-media"
+
+[[streams]]
+id = "tv1-hd"
+url = "http://192.168.1.79:10015/HLS/1001761_IRIB%20TV1/p.m3u8"
+
+[[streams]]
+id = "news"
+url = "http://192.168.1.79:10015/HLS/1001848_NAMAYESH/p.m3u8"

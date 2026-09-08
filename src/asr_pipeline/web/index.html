@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>IPTV ASR proof of concept</title>
+  <style>
+    body { background:#101216; color:#f0f2f5; font:16px system-ui,sans-serif; margin:2rem auto; max-width:960px; padding:0 1rem; }
+    .controls { display:flex; flex-wrap:wrap; gap:.75rem; align-items:center; }
+    select,button { font:inherit; padding:.55rem; } select { min-width:18rem; }
+    .toggle { display:flex; align-items:center; gap:.4rem; }
+    #player { position:relative; margin-top:1rem; background:#000; min-height:18rem; }
+    video { display:block; width:100%; max-height:70vh; }
+    #caption { bottom:8%; display:none; font-size:1.3rem; left:5%; position:absolute; right:5%; text-align:center; text-shadow:0 2px 5px #000; }
+    #caption span { background:rgba(0,0,0,.75); border-radius:.3rem; box-decoration-break:clone; box-decoration-break:clone; line-height:1.6; padding:.2rem .45rem; }
+    #status { color:#a9d5ff; min-height:1.4rem; white-space:pre-wrap; }
+    .warning { color:#ffc46b; }
+  </style>
+</head>
+<body>
+  <h1>IPTV ASR proof of concept</h1>
+  <div class="controls">
+    <label>Channel <select id="channels" disabled><option>Loading channels…</option></select></label>
+    <button id="play" disabled>Play</button>
+    <label class="toggle"><input id="subtitles" type="checkbox" checked> Enable subtitles</label>
+  </div>
+  <div id="player"><video id="video" controls autoplay muted></video><div id="caption"><span></span></div></div>
+  <p id="status"></p>
+  <p class="warning" id="warning"></p>
+  <script src="/hls.min.js"></script>
+  <script>
+    const channels = document.querySelector('#channels');
+    const play = document.querySelector('#play');
+    const video = document.querySelector('#video');
+    const subtitles = document.querySelector('#subtitles');
+    const caption = document.querySelector('#caption');
+    const captionText = caption.querySelector('span');
+    const status = document.querySelector('#status');
+    const warning = document.querySelector('#warning');
+    let hls, events, selectedId, captionQueue = [];
+
+    function setStatus(text) { status.textContent = text; }
+    function destroyPlayer() { if (hls) { hls.destroy(); hls = null; } video.removeAttribute('src'); video.load(); }
+    function renderCaption() {
+      const now = video.currentTime;
+      const active = captionQueue.find(event => event.start_seconds <= now && now <= event.end_seconds);
+      captionText.textContent = active ? active.text : '';
+    }
+    function captions() {
+      if (events) { events.close(); events = null; }
+      caption.style.display = 'none';
+      captionQueue = [];
+      if (!subtitles.checked || !selectedId) return;
+      caption.style.display = 'block';
+      events = new EventSource(`/api/captions?channel_id=${encodeURIComponent(selectedId)}`);
+      events.onmessage = ({data}) => {
+        const event = JSON.parse(data);
+        captionQueue.push(event);
+        // Keep a small history for video seeking/rebuffering, without allowing
+        // a long-running live session to grow unbounded.
+        captionQueue = captionQueue.filter(item => item.end_seconds >= video.currentTime - 15);
+        renderCaption();
+      };
+      events.onerror = () => setStatus('Caption connection is waiting for finalized local ASR output…');
+    }
+    function loadPlayer() {
+      destroyPlayer();
+      const source = `/media/playlist?channel_id=${encodeURIComponent(selectedId)}&v=${Date.now()}`;
+      if (window.Hls && Hls.isSupported()) {
+        // The IPTV HLS source publishes ~10-second bursts. Stay sufficiently
+        // behind the live edge to absorb the interval between bursts.
+        hls = new Hls({enableWorker:true, liveSyncDurationCount:6, liveMaxLatencyDurationCount:12, maxBufferLength:35});
+        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(error => setStatus(error.message)));
+        hls.on(Hls.Events.ERROR, (_, detail) => { if (detail.fatal) setStatus(`Playback error: ${detail.details}`); });
+        hls.loadSource(source); hls.attachMedia(video);
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = source; video.play().catch(error => setStatus(error.message));
+      } else setStatus('This browser cannot play HLS.');
+    }
+    async function selectChannel() {
+      selectedId = channels.value;
+      if (!selectedId) return;
+      setStatus('Starting local transcription and preparing playback…'); warning.textContent = '';
+      const response = await fetch('/api/select', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel_id:selectedId})});
+      const result = await response.json();
+      if (!response.ok) throw Error(result.error || response.status);
+      loadPlayer(); captions();
+      warning.textContent = result.mode === 'local_cmaf' ? 'Playback is repackaged locally with AAC-LC audio for browser compatibility.' : '';
+      setStatus('Playing. Local ASR continues even when subtitles are hidden.');
+    }
+    async function loadChannels() {
+      const response = await fetch('/api/channels'); if (!response.ok) throw Error(response.status);
+      const list = await response.json(); channels.innerHTML = '';
+      for (const channel of list) { const option = document.createElement('option'); option.value = channel.id; option.textContent = `${channel.name} — ${channel.video_codec || '?'} ${channel.height || '?'}p`; channels.append(option); }
+      channels.disabled = false; play.disabled = false; setStatus(`Loaded ${list.length} active channels.`);
+    }
+    play.onclick = () => selectChannel().catch(error => setStatus(`Error: ${error.message}`));
+    subtitles.onchange = captions;
+    video.addEventListener('timeupdate', renderCaption);
+    video.addEventListener('seeking', renderCaption);
+    loadChannels().catch(error => setStatus(`Channel list failed: ${error.message}`));
+  </script>
+</body>
+</html>
