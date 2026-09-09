@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import hashlib
 import multiprocessing as mp
 from pathlib import Path
 from queue import Empty, Queue
@@ -12,7 +13,7 @@ import sys
 import threading
 import time
 import tomllib
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Protocol
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -20,6 +21,7 @@ import numpy as np
 
 from .config import ConfigurationError, PipelineConfig, load_config
 from .contracts import AudioWindow
+from .pipeline import CapacityError, capacity_for_rtf
 from .worker import BenchmarkResult, WorkItem, WorkResult, WorkerReady, WorkerSettings, configure_cuda_libraries, worker_main
 
 
@@ -32,6 +34,16 @@ class PocConfig:
     credentials_env: Path
     username_variable: str
     password_variable: str
+    media_directory: Path
+
+
+@dataclass(frozen=True)
+class PublicPocConfig:
+    pipeline: PipelineConfig
+    bind_host: str
+    port: int
+    playlist_url: str
+    playlist_cache_path: Path
     media_directory: Path
 
 
@@ -62,10 +74,20 @@ class Session:
     generation: int
     channel: Channel
     internal_stream_id: str
+    worker: "PocWorker"
     stop_requested: threading.Event = field(default_factory=threading.Event)
     pending: AudioWindow | None = None
     inflight_sequence: int | None = None
     next_sequence: int = 0
+
+
+@dataclass
+class PocWorker:
+    worker_id: int
+    process: mp.Process
+    input_queue: mp.Queue
+    capacity: int
+    stream_ids: set[str] = field(default_factory=set)
 
 
 def load_poc_config(path: str | Path) -> PocConfig:
@@ -102,6 +124,43 @@ def load_poc_config(path: str | Path) -> PocConfig:
         credentials_env=credentials_env,
         username_variable=string("username_variable"),
         password_variable=string("password_variable"),
+        media_directory=media_directory,
+    )
+
+
+def load_public_poc_config(path: str | Path) -> PublicPocConfig:
+    pipeline = load_config(path)
+    config_path = Path(path).expanduser()
+    with config_path.open("rb") as file:
+        document = tomllib.load(file)
+    section = document.get("poc_public")
+    if not isinstance(section, dict):
+        raise ConfigurationError("[poc_public] section is required")
+
+    def string(key: str) -> str:
+        value = section.get(key)
+        if not isinstance(value, str) or not value:
+            raise ConfigurationError(f"poc_public.{key} is required")
+        return value
+
+    port = section.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ConfigurationError("poc_public.port must be a TCP port number")
+    playlist_url = string("playlist_url")
+    if not playlist_url.startswith(("http://", "https://")):
+        raise ConfigurationError("poc_public.playlist_url must be an HTTP(S) URL")
+    playlist_cache_path = Path(string("playlist_cache_path")).expanduser()
+    if not playlist_cache_path.is_absolute():
+        playlist_cache_path = config_path.parent / playlist_cache_path
+    media_directory = Path(string("media_directory")).expanduser()
+    if not media_directory.is_absolute():
+        media_directory = config_path.parent / media_directory
+    return PublicPocConfig(
+        pipeline=pipeline,
+        bind_host=string("bind_host"),
+        port=port,
+        playlist_url=playlist_url,
+        playlist_cache_path=playlist_cache_path,
         media_directory=media_directory,
     )
 
@@ -150,25 +209,77 @@ class IptvClient:
         return channels
 
 
+class ChannelCatalog(Protocol):
+    def channels(self) -> dict[str, Channel]: ...
+
+
+def parse_m3u_channels(playlist: str) -> dict[str, Channel]:
+    """Parse an extended M3U catalog, retaining direct FFmpeg-compatible URLs."""
+    channels: dict[str, Channel] = {}
+    name: str | None = None
+    for raw_line in playlist.splitlines():
+        line = raw_line.strip()
+        if line.startswith("#EXTINF:"):
+            _, _, title = line.partition(",")
+            name = title.strip() or "Unnamed channel"
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if name is not None and line.startswith(("http://", "https://", "rtsp://", "udp://")):
+            channel_id = hashlib.sha256(line.encode()).hexdigest()[:20]
+            channels[channel_id] = Channel(channel_id, name, line, None, None)
+        name = None
+    return channels
+
+
+class PublicPlaylistClient:
+    def __init__(self, config: PublicPocConfig) -> None:
+        self._config = config
+        self._lock = threading.Lock()
+        self._channels: dict[str, Channel] | None = None
+
+    def channels(self) -> dict[str, Channel]:
+        with self._lock:
+            if self._channels is None:
+                cache = self._config.playlist_cache_path
+                if cache.is_file():
+                    playlist = cache.read_text(encoding="utf-8-sig", errors="replace")
+                else:
+                    with urlopen(self._config.playlist_url, timeout=30) as response:
+                        payload = response.read()
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = cache.with_name(cache.name + ".tmp")
+                    temporary.write_bytes(payload)
+                    temporary.replace(cache)
+                    playlist = payload.decode("utf-8-sig", errors="replace")
+                self._channels = parse_m3u_channels(playlist)
+                if not self._channels:
+                    raise RuntimeError("public IPTV playlist contains no playable channels")
+            return self._channels
+
+
 class CaptionHub:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._subscribers: set[Queue[str]] = set()
+        self._subscribers: dict[Queue[str], str] = {}
 
-    def subscribe(self) -> Queue[str]:
+    def subscribe(self, channel_id: str) -> Queue[str]:
         subscriber: Queue[str] = Queue(maxsize=16)
         with self._lock:
-            self._subscribers.add(subscriber)
+            self._subscribers[subscriber] = channel_id
         return subscriber
 
     def unsubscribe(self, subscriber: Queue[str]) -> None:
         with self._lock:
-            self._subscribers.discard(subscriber)
+            self._subscribers.pop(subscriber, None)
 
     def publish(self, event: dict[str, Any]) -> None:
         payload = json.dumps(event, ensure_ascii=False)
         with self._lock:
-            subscribers = tuple(self._subscribers)
+            subscribers = tuple(
+                subscriber for subscriber, channel_id in self._subscribers.items()
+                if channel_id == event["channel_id"]
+            )
         for subscriber in subscribers:
             try:
                 subscriber.put_nowait(payload)
@@ -178,57 +289,102 @@ class CaptionHub:
 
 
 class PocTranscriber:
-    """One persistent local model worker with replaceable live-source sessions."""
+    """Capacity-aware local workers with one independently scheduled session per channel."""
 
-    def __init__(self, config: PocConfig, captions: CaptionHub) -> None:
+    def __init__(self, config: PocConfig | PublicPocConfig, captions: CaptionHub) -> None:
         self._config = config
         self._captions = captions
         self._context = mp.get_context("spawn")
-        self._input: mp.Queue = self._context.Queue()
         self._output: mp.Queue = self._context.Queue()
-        self._process = self._context.Process(
-            target=worker_main,
-            args=(0, WorkerSettings(config.pipeline.model, None, None), self._input, self._output),
-            daemon=True,
-        )
+        self._benchmark_results: Queue[BenchmarkResult] = Queue()
         self._lock = threading.Lock()
-        self._session: Session | None = None
+        self._worker_lock = threading.Lock()
+        self._sessions: dict[str, Session] = {}
+        self._workers: list[PocWorker] = []
         self._generation = 0
         self._stopping = threading.Event()
-        configure_cuda_libraries(config.pipeline.model)
-        self._process.start()
-        self._await_ready()
+
+        first = self._start_worker(0)
+        self._workers.append(first)
+        first.capacity = self._await_benchmark(0)
         self._results_thread = threading.Thread(target=self._drain_results, name="asr-results", daemon=True)
         self._results_thread.start()
+        print(f"POC ASR ready: capacity={first.capacity} stream(s)/worker", file=sys.stderr)
 
-    def _await_ready(self) -> None:
+    def _start_worker(self, worker_id: int) -> PocWorker:
+        configure_cuda_libraries(self._config.pipeline.model)
+        core_sets = self._config.pipeline.workers.core_sets
+        core_set = core_sets[worker_id] if core_sets else None
+        input_queue: mp.Queue = self._context.Queue()
+        settings = WorkerSettings(
+            self._config.pipeline.model,
+            str(self._config.pipeline.benchmark_audio),
+            core_set,
+        )
+        process = self._context.Process(
+            target=worker_main,
+            args=(worker_id, settings, input_queue, self._output),
+            daemon=True,
+        )
+        process.start()
+        return PocWorker(worker_id, process, input_queue, capacity=0)
+
+    def _await_benchmark(self, worker_id: int) -> int:
         try:
-            message = self._output.get(timeout=180)
+            while True:
+                message = self._output.get(timeout=180) if not self._results_thread_alive() else self._benchmark_results.get(timeout=180)
+                if isinstance(message, BenchmarkResult) and message.worker_id == worker_id:
+                    if message.error:
+                        raise CapacityError(f"worker {worker_id} benchmark failed: {message.error}")
+                    assert message.rtf is not None
+                    return capacity_for_rtf(message.rtf)
         except Empty as error:
-            self.stop()
-            raise RuntimeError("timed out loading local Faster-Whisper model") from error
-        if isinstance(message, WorkerReady) and message.error is None:
-            return
-        self.stop()
-        if isinstance(message, BenchmarkResult):
-            raise RuntimeError(f"model worker failed: {message.error}")
-        raise RuntimeError("model worker did not become ready")
+            raise CapacityError("timed out waiting for Faster-Whisper startup benchmark") from error
+
+    def _results_thread_alive(self) -> bool:
+        return hasattr(self, "_results_thread") and self._results_thread.is_alive()
+
+    def _allocate_worker(self) -> PocWorker:
+        with self._worker_lock:
+            candidates = [worker for worker in self._workers if len(worker.stream_ids) < worker.capacity]
+            if candidates:
+                return min(candidates, key=lambda worker: len(worker.stream_ids))
+            worker_id = len(self._workers)
+            if worker_id >= self._config.pipeline.workers.max_workers:
+                raise CapacityError(
+                    f"active channels exceed the measured capacity of workers.max_workers = "
+                    f"{self._config.pipeline.workers.max_workers}"
+                )
+            worker = self._start_worker(worker_id)
+            self._workers.append(worker)
+            try:
+                worker.capacity = self._await_benchmark(worker_id)
+            except Exception:
+                self._workers.remove(worker)
+                self._stop_worker(worker)
+                raise
+            print(f"POC ASR added worker {worker_id}: capacity={worker.capacity} stream(s)", file=sys.stderr)
+            return worker
 
     def select(self, channel: Channel, audio: BinaryIO) -> None:
-        """Transcribe PCM emitted by the same FFmpeg ingest as playback."""
+        """Transcribe PCM emitted by the selected channel's dedicated FFmpeg ingest."""
         with self._lock:
-            if self._session is not None:
-                self._session.stop_requested.set()
+            if channel.id in self._sessions:
+                return
+        worker = self._allocate_worker()
+        with self._lock:
+            if channel.id in self._sessions:
+                return
             self._generation += 1
-            session = Session(self._generation, channel, f"poc-{self._generation}")
-            self._session = session
-        thread = threading.Thread(
+            session = Session(self._generation, channel, f"poc-{self._generation}", worker)
+            self._sessions[session.internal_stream_id] = session
+            worker.stream_ids.add(session.internal_stream_id)
+        threading.Thread(
             target=self._consume_source,
             args=(session, audio),
             name=f"audio-{channel.id}",
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
     def _consume_source(self, session: Session, audio: BinaryIO) -> None:
         bytes_per_window = int(self._config.pipeline.audio.sample_rate * self._config.pipeline.audio.window_seconds) * 2
@@ -254,7 +410,7 @@ class PocTranscriber:
 
     def _submit(self, session: Session, window: AudioWindow) -> None:
         with self._lock:
-            if self._session is not session or session.stop_requested.is_set():
+            if self._sessions.get(session.internal_stream_id) is not session or session.stop_requested.is_set():
                 return
             if session.inflight_sequence is not None:
                 session.pending = window
@@ -264,7 +420,7 @@ class PocTranscriber:
     def _dispatch_locked(self, session: Session, window: AudioWindow) -> None:
         session.next_sequence += 1
         session.inflight_sequence = session.next_sequence
-        self._input.put(WorkItem(
+        session.worker.input_queue.put(WorkItem(
             stream_id=session.internal_stream_id, sequence=session.next_sequence,
             start_seconds=window.start_seconds, end_seconds=window.end_seconds, samples=window.samples,
         ))
@@ -275,22 +431,29 @@ class PocTranscriber:
                 result = self._output.get(timeout=0.2)
             except Empty:
                 continue
+            if isinstance(result, BenchmarkResult):
+                self._benchmark_results.put(result)
+                continue
             if not isinstance(result, WorkResult):
                 continue
             with self._lock:
-                session = self._session
-                if session is None or result.stream_id != session.internal_stream_id or result.sequence != session.inflight_sequence:
+                session = self._sessions.get(result.stream_id)
+                if session is None or result.sequence != session.inflight_sequence:
                     continue
                 session.inflight_sequence = None
                 if result.error:
                     print(f"[{session.channel.id}] transcription failed: {result.error}", file=sys.stderr)
                 else:
+                    rtf = result.processing_seconds / result.audio_seconds if result.audio_seconds else None
+                    self._captions.publish({
+                        "type": "metrics", "channel_id": session.channel.id, "rtf": rtf,
+                    })
                     for segment in result.segments:
                         self._captions.publish({
-                            "channel_id": session.channel.id, "language": result.language,
+                            "type": "caption", "channel_id": session.channel.id, "language": result.language,
                             "start_seconds": segment.start_seconds, "end_seconds": segment.end_seconds,
                             "text": segment.text,
-                            "rtf": result.processing_seconds / result.audio_seconds if result.audio_seconds else None,
+                            "rtf": rtf,
                         })
                     if result.processing_seconds > result.audio_seconds:
                         session.pending = None
@@ -299,33 +462,39 @@ class PocTranscriber:
                     pending, session.pending = session.pending, None
                     self._dispatch_locked(session, pending)
 
-    def current_channel_id(self) -> str | None:
+    def has_channel(self, channel_id: str) -> bool:
         with self._lock:
-            return self._session.channel.id if self._session else None
+            return any(session.channel.id == channel_id for session in self._sessions.values())
 
     def stop(self) -> None:
         self._stopping.set()
         with self._lock:
-            if self._session is not None:
-                self._session.stop_requested.set()
-        if self._process.is_alive():
-            self._input.put(None)
-            self._process.join(timeout=10)
-        if self._process.is_alive():
-            self._process.terminate()
-            self._process.join(timeout=5)
+            for session in self._sessions.values():
+                session.stop_requested.set()
+        for worker in self._workers:
+            self._stop_worker(worker)
+        self._workers.clear()
+
+    @staticmethod
+    def _stop_worker(worker: PocWorker) -> None:
+        if worker.process.is_alive():
+            worker.input_queue.put(None)
+            worker.process.join(timeout=10)
+        if worker.process.is_alive():
+            worker.process.terminate()
+            worker.process.join(timeout=5)
 
 
 class LocalCmafPackager:
     """Dedicated local playback adapter; it never changes the shared IPTV remuxer."""
 
-    def __init__(self, config: PocConfig) -> None:
+    def __init__(self, config: PocConfig | PublicPocConfig, media_directory: Path) -> None:
         self._config = config
+        self._media_directory = media_directory
         self._lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
         self._generation = 0
-        shutil.rmtree(self._config.media_directory, ignore_errors=True)
-        self._config.media_directory.mkdir(parents=True, exist_ok=True)
+        self._media_directory.mkdir(parents=True, exist_ok=True)
 
     def start(self, channel: Channel) -> PackagedMedia:
         with self._lock:
@@ -333,7 +502,7 @@ class LocalCmafPackager:
             # Keep old media files until shutdown: an HLS.js instance can still
             # request its previous playlist while the new selection starts.
             self._generation += 1
-            output_directory = self._config.media_directory / str(self._generation)
+            output_directory = self._media_directory / str(self._generation)
             output_directory.mkdir(parents=True, exist_ok=True)
             manifest = output_directory / "stream.m3u8"
             video_tag = "hvc1" if (channel.video_codec or "").lower() in {"hevc", "h265"} else "avc1"
@@ -376,7 +545,9 @@ class LocalCmafPackager:
     def _has_startup_buffer(manifest: Path) -> bool:
         if not manifest.is_file() or not (manifest.parent / "init.mp4").is_file():
             return False
-        return manifest.read_text().count("#EXTINF:") >= 6
+        # A single fMP4 segment is enough for HLS.js to start. Requiring a
+        # six-segment live buffer here wrongly rejects slower public streams.
+        return "#EXTINF:" in manifest.read_text()
 
     def stop(self) -> None:
         with self._lock:
@@ -396,40 +567,54 @@ class LocalCmafPackager:
 
 
 class PocService:
-    def __init__(self, config: PocConfig) -> None:
+    def __init__(self, config: PocConfig | PublicPocConfig, catalog: ChannelCatalog) -> None:
         self.config = config
-        self.iptv = IptvClient(config)
+        self.catalog = catalog
         self.captions = CaptionHub()
         self.transcriber = PocTranscriber(config, self.captions)
-        self.packager = LocalCmafPackager(config)
+        shutil.rmtree(self.config.media_directory, ignore_errors=True)
+        self.config.media_directory.mkdir(parents=True, exist_ok=True)
         self._selection_lock = threading.Lock()
         self._playback_lock = threading.Lock()
-        self._playback: Playback | None = None
+        self._playbacks: dict[str, Playback] = {}
+        self._packagers: dict[str, LocalCmafPackager] = {}
 
     def channels(self) -> dict[str, Channel]:
-        return self.iptv.channels()
+        return self.catalog.channels()
 
     def select(self, channel_id: str) -> Playback:
         channel = self.channels().get(channel_id)
         if channel is None:
             raise ValueError("unknown or inactive channel")
         with self._selection_lock:
-            media = self.packager.start(channel)
+            with self._playback_lock:
+                existing = self._playbacks.get(channel_id)
+            if existing is not None:
+                return existing
+            media_directory = self.config.media_directory / hashlib.sha256(channel_id.encode()).hexdigest()[:20]
+            packager = LocalCmafPackager(self.config, media_directory)
+            media = packager.start(channel)
             # FFmpeg writes playback media and PCM from one ingest. Start
             # draining PCM before waiting for the player buffer so its pipe
             # cannot stall the CMAF packager.
-            self.transcriber.select(channel, media.audio)
-            self.packager.await_startup_buffer(media.manifest_path)
+            try:
+                self.transcriber.select(channel, media.audio)
+                packager.await_startup_buffer(media.manifest_path)
+            except Exception:
+                packager.stop()
+                raise
             playback = Playback(channel, media.manifest_path, "local_cmaf")
             with self._playback_lock:
-                self._playback = playback
+                self._playbacks[channel_id] = playback
+                self._packagers[channel_id] = packager
             return playback
 
     def playback(self, channel_id: str) -> Playback:
         with self._playback_lock:
-            if self._playback is None or self._playback.channel.id != channel_id:
+            playback = self._playbacks.get(channel_id)
+            if playback is None:
                 raise ValueError("channel is not selected")
-            return self._playback
+            return playback
 
     @staticmethod
     def read_media(playback: Playback, path: str) -> tuple[bytes, str]:
@@ -440,7 +625,12 @@ class PocService:
         return candidate.read_bytes(), content_type
 
     def stop(self) -> None:
-        self.packager.stop()
+        with self._playback_lock:
+            packagers = tuple(self._packagers.values())
+            self._packagers.clear()
+            self._playbacks.clear()
+        for packager in packagers:
+            packager.stop()
         self.transcriber.stop()
 
 

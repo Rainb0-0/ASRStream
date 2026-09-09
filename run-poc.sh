@@ -15,6 +15,7 @@ config_path=$(cd -- "$(dirname -- "$config_path")" && pwd)/$(basename -- "$confi
 
 python_binary=${PYTHON_BIN:-python3.12}
 venv_directory="$project_directory/.venv"
+poc_entrypoint=${POC_ENTRYPOINT:-asr-poc}
 
 if ! command -v "$python_binary" >/dev/null 2>&1; then
   echo "Python 3.12 is required. Install it or set PYTHON_BIN to its path." >&2
@@ -35,8 +36,7 @@ fi
 
 cd "$project_directory"
 
-"$venv_directory/bin/python" -m pip install --upgrade pip
-"$venv_directory/bin/python" -m pip install "$project_directory"
+"$venv_directory/bin/python" -m pip install --no-build-isolation "$project_directory"
 
 # CTranslate2 discovers these shared libraries at runtime when the POC uses
 # the CUDA defaults in config.example.toml. CPU configurations skip them.
@@ -48,4 +48,4 @@ if grep -Eq '^[[:space:]]*device[[:space:]]*=[[:space:]]*"cuda"' "$config_path" 
     'nvidia-cuda-nvrtc-cu12>=12,<13'
 fi
 
-exec "$venv_directory/bin/asr-poc" --config "$config_path" "$@"
+exec "$venv_directory/bin/$poc_entrypoint" --config "$config_path" "$@"

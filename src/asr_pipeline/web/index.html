@@ -9,6 +9,8 @@
     .controls { display:flex; flex-wrap:wrap; gap:.75rem; align-items:center; }
     select,button { font:inherit; padding:.55rem; } select { min-width:18rem; }
     .toggle { display:flex; align-items:center; gap:.4rem; }
+    #rtf { color:#a9d5ff; font-variant-numeric:tabular-nums; }
+    #rtf.behind { color:#ffc46b; }
     #player { position:relative; margin-top:1rem; background:#000; min-height:18rem; }
     video { display:block; width:100%; max-height:70vh; }
     #caption { bottom:8%; display:none; font-size:1.3rem; left:5%; position:absolute; right:5%; text-align:center; text-shadow:0 2px 5px #000; }
@@ -23,6 +25,7 @@
     <label>Channel <select id="channels" disabled><option>Loading channels…</option></select></label>
     <button id="play" disabled>Play</button>
     <label class="toggle"><input id="subtitles" type="checkbox" checked> Enable subtitles</label>
+    <output id="rtf" aria-live="polite">ASR RTF: waiting</output>
   </div>
   <div id="player"><video id="video" controls autoplay muted></video><div id="caption"><span></span></div></div>
   <p id="status"></p>
@@ -37,9 +40,15 @@
     const captionText = caption.querySelector('span');
     const status = document.querySelector('#status');
     const warning = document.querySelector('#warning');
+    const rtf = document.querySelector('#rtf');
     let hls, events, selectedId, captionQueue = [];
 
     function setStatus(text) { status.textContent = text; }
+    function setRtf(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return;
+      rtf.textContent = `ASR RTF: ${value.toFixed(2)}×${value >= 1 ? ' (behind realtime)' : ''}`;
+      rtf.classList.toggle('behind', value >= 1);
+    }
     function destroyPlayer() { if (hls) { hls.destroy(); hls = null; } video.removeAttribute('src'); video.load(); }
     function renderCaption() {
       const now = video.currentTime;
@@ -48,13 +57,14 @@
     }
     function captions() {
       if (events) { events.close(); events = null; }
-      caption.style.display = 'none';
+      caption.style.display = subtitles.checked ? 'block' : 'none';
       captionQueue = [];
-      if (!subtitles.checked || !selectedId) return;
-      caption.style.display = 'block';
+      if (!selectedId) return;
       events = new EventSource(`/api/captions?channel_id=${encodeURIComponent(selectedId)}`);
       events.onmessage = ({data}) => {
         const event = JSON.parse(data);
+        setRtf(event.rtf);
+        if (event.type === 'metrics' || !subtitles.checked) return;
         captionQueue.push(event);
         // Keep a small history for video seeking/rebuffering, without allowing
         // a long-running live session to grow unbounded.
@@ -81,6 +91,7 @@
       selectedId = channels.value;
       if (!selectedId) return;
       setStatus('Starting local transcription and preparing playback…'); warning.textContent = '';
+      rtf.textContent = 'ASR RTF: waiting'; rtf.classList.remove('behind');
       const response = await fetch('/api/select', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channel_id:selectedId})});
       const result = await response.json();
       if (!response.ok) throw Error(result.error || response.status);

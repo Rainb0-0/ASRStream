@@ -1,0 +1,40 @@
+# Public IPTV-org player POC. No company tunnel or credentials are required.
+
+[model]
+model_path = "./models/faster-whisper-large-v3"
+device = "cuda"
+device_index = 0
+compute_type = "float16"
+cpu_threads = 5
+beam_size = 2
+vad_filter = true
+
+[workers]
+max_workers = 2
+
+[benchmark]
+audio_path = "./assets/benchmark-iribtv1-30s.wav"
+
+[audio]
+ffmpeg_path = "ffmpeg"
+sample_rate = 16000
+window_seconds = 5.0
+reconnect_initial_seconds = 1.0
+reconnect_max_seconds = 30.0
+
+[sink]
+type = "stdout_ndjson"
+
+[poc_public]
+bind_host = "127.0.0.1"
+port = 8081
+playlist_url = "https://iptv-org.github.io/iptv/index.m3u"
+# Downloaded once on first run; later launches use this local cache.
+playlist_cache_path = "./.runtime/public-iptv/index.m3u"
+media_directory = "./.runtime/public-poc-media"
+
+# Required by the core pipeline configuration. The public POC dynamically
+# selects its sources from playlist_url instead of using this placeholder.
+[[streams]]
+id = "public-playlist"
+url = "https://iptv-org.github.io/iptv/index.m3u"

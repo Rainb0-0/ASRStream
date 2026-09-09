@@ -8,7 +8,7 @@ from queue import Empty
 import sys
 from urllib.parse import parse_qs, urlparse
 from .config import ConfigurationError
-from .poc import PocService, load_poc_config, rewrite_playlist
+from .poc import IptvClient, PocService, load_poc_config, rewrite_playlist
 
 
 STATIC = Path(__file__).with_name("web")
@@ -79,9 +79,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _captions(self, query: dict[str, list[str]]) -> None:
         channel_id = self._one(query, "channel_id")
-        if self.service.transcriber.current_channel_id() != channel_id:
+        if not self.service.transcriber.has_channel(channel_id):
             raise ValueError("channel is not selected")
-        subscriber = self.service.captions.subscribe()
+        subscriber = self.service.captions.subscribe(channel_id)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -130,13 +130,19 @@ def main() -> None:
     arguments = parser.parse_args()
     try:
         config = load_poc_config(arguments.config)
-        service = PocService(config)
+        service = PocService(config, IptvClient(config))
     except (ConfigurationError, RuntimeError) as error:
         print(f"POC startup error: {error}", file=sys.stderr)
         raise SystemExit(2) from error
+    serve(config, service, "POC player")
+
+
+def serve(config: object, service: PocService, label: str) -> None:
+    bind_host = getattr(config, "bind_host")
+    port = getattr(config, "port")
     Handler.service = service
-    server = ThreadingHTTPServer((config.bind_host, config.port), Handler)
-    print(f"POC player: http://{config.bind_host}:{config.port}/", file=sys.stderr)
+    server = ThreadingHTTPServer((bind_host, port), Handler)
+    print(f"{label}: http://{bind_host}:{port}/", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

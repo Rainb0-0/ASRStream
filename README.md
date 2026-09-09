@@ -66,6 +66,22 @@ To run the already-installed entry point directly:
 asr-poc --config config.example.toml
 ```
 
+## Public IPTV-org proof of concept
+
+The public POC is separate from the company-tunnel POC. It downloads the
+current [iptv-org public catalog](https://iptv-org.github.io/iptv/index.m3u),
+shows its channels in the same player, and transcribes the selected stream
+locally. It has no credential or tunnel dependency.
+
+```bash
+./run-public-poc.sh
+```
+
+It listens on `http://127.0.0.1:8081/` by default. Individual public streams
+can be unavailable or use codecs that a browser cannot play; select another
+channel when the catalog entry cannot be packaged. The catalog is downloaded
+once to `.runtime/public-iptv/index.m3u`; later launches use that cached copy.
+
 Open `http://127.0.0.1:8080/`. The service resolves channels through the
 authenticated API, packages the selected channel locally as CMAF with AAC-LC
 audio, and sends finalized Large-v3 segments to the subtitle overlay via SSE.
