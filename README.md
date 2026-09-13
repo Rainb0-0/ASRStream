@@ -77,6 +77,19 @@ locally. It has no credential or tunnel dependency.
 ./run-public-poc.sh
 ```
 
+On Windows PowerShell, the all-in-one launcher performs the same virtual
+environment and dependency setup:
+
+```powershell
+.\run-public-poc.ps1
+```
+
+Pass a custom config as the first argument, followed by any CLI arguments:
+
+```powershell
+.\run-public-poc.ps1 .\config.public.example.toml
+```
+
 It listens on `http://127.0.0.1:8081/` by default. Individual public streams
 can be unavailable or use codecs that a browser cannot play; select another
 channel when the catalog entry cannot be packaged. The catalog is downloaded
