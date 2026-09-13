@@ -12,7 +12,7 @@ from queue import Empty
 from asr_pipeline.config import ConfigurationError, load_config
 from asr_pipeline.contracts import TranscriptEvent, TranscriptSegment
 from asr_pipeline.pipeline import CapacityError, capacity_for_rtf, required_worker_count
-from asr_pipeline.poc import CaptionHub, Channel, LocalCmafPackager, Playback, PocService, PublicPlaylistClient, PublicPocConfig, parse_m3u_channels, rewrite_playlist
+from asr_pipeline.poc import CaptionHub, Channel, LocalCmafPackager, Playback, PocService, PocTranscriber, PublicPlaylistClient, PublicPocConfig, Session, parse_m3u_channels, rewrite_playlist
 from asr_pipeline.sink import NdjsonStdoutSink
 
 
@@ -152,6 +152,24 @@ class PocMultichannelTests(unittest.TestCase):
         service._playbacks = {"first": first, "second": second}
         self.assertIs(service.playback("first"), first)
         self.assertIs(service.playback("second"), second)
+
+    def test_deselected_channel_is_removed_from_asr_sessions(self) -> None:
+        transcriber = object.__new__(PocTranscriber)
+        transcriber._lock = threading.Lock()
+        worker = type("Worker", (), {"stream_ids": {"poc-1"}})()
+        session = Session(
+            1,
+            Channel("first", "First", "https://first.test/live", None, None),
+            "poc-1",
+            worker,
+        )
+        transcriber._sessions = {session.internal_stream_id: session}
+
+        transcriber.stop_channels({"first"})
+
+        self.assertTrue(session.stop_requested.is_set())
+        self.assertNotIn(session.internal_stream_id, transcriber._sessions)
+        self.assertNotIn(session.internal_stream_id, worker.stream_ids)
 
     def test_cmaf_packager_accepts_first_playable_segment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

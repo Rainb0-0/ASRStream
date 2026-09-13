@@ -466,6 +466,20 @@ class PocTranscriber:
         with self._lock:
             return any(session.channel.id == channel_id for session in self._sessions.values())
 
+    def stop_channels(self, channel_ids: set[str]) -> None:
+        """Stop feeding ASR for channels no longer watched by the POC player."""
+        if not channel_ids:
+            return
+        with self._lock:
+            sessions = tuple(
+                session for session in self._sessions.values()
+                if session.channel.id in channel_ids
+            )
+            for session in sessions:
+                session.stop_requested.set()
+                self._sessions.pop(session.internal_stream_id, None)
+                session.worker.stream_ids.discard(session.internal_stream_id)
+
     def stop(self) -> None:
         self._stopping.set()
         with self._lock:
@@ -589,8 +603,19 @@ class PocService:
         with self._selection_lock:
             with self._playback_lock:
                 existing = self._playbacks.get(channel_id)
+                old_channel_ids = set(self._playbacks) - {channel_id}
+                old_packagers = tuple(
+                    self._packagers.pop(old_channel_id)
+                    for old_channel_id in old_channel_ids
+                    if old_channel_id in self._packagers
+                )
+                for old_channel_id in old_channel_ids:
+                    self._playbacks.pop(old_channel_id, None)
             if existing is not None:
                 return existing
+            for packager in old_packagers:
+                packager.stop()
+            self.transcriber.stop_channels(old_channel_ids)
             media_directory = self.config.media_directory / hashlib.sha256(channel_id.encode()).hexdigest()[:20]
             packager = LocalCmafPackager(self.config, media_directory)
             media = packager.start(channel)
