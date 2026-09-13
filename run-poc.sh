@@ -38,6 +38,9 @@ cd "$project_directory"
 
 "$venv_directory/bin/python" -m pip install --no-build-isolation "$project_directory"
 
+# Download the configured Faster-Whisper model on first run; later runs reuse it.
+"$venv_directory/bin/python" -m asr_pipeline.model_download --config "$config_path"
+
 # CTranslate2 discovers these shared libraries at runtime when the POC uses
 # the CUDA defaults in config.example.toml. CPU configurations skip them.
 if grep -Eq '^[[:space:]]*device[[:space:]]*=[[:space:]]*"cuda"' "$config_path" && \

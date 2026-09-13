@@ -15,8 +15,8 @@ segments as NDJSON on standard output.
 
 Install the package, copy `config.example.toml` to a deployment-specific path,
 and set the absolute model path, stream URLs, and benchmark file path. The
-pipeline never downloads a model: `model.model_path` must point to the copied
-local Large-v3 directory.
+core pipeline expects `model.model_path` to point to a local Large-v3
+directory; the launchers below can download that model on first run.
 
 ```bash
 python -m pip install .
@@ -57,8 +57,10 @@ Pass a deployment-specific config as the first argument when needed:
 ```
 
 The launcher installs the CUDA runtime wheels only when the selected config
-uses `device = "cuda"`. It does not download the Large-v3 model; the config
-must continue to point at an existing local model directory.
+uses `device = "cuda"`. On first run it downloads
+`Systran/faster-whisper-large-v3` from Hugging Face into the configured
+`model_path`; later runs reuse the local copy. This requires network access
+and several GB of disk space.
 
 To run the already-installed entry point directly:
 

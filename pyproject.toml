@@ -9,6 +9,7 @@ description = "Configurable real-time IPTV transcription pipeline"
 requires-python = ">=3.11"
 dependencies = [
   "faster-whisper>=1.1,<2",
+  "huggingface-hub>=0.25,<1",
   "numpy>=1.26,<3",
 ]
 

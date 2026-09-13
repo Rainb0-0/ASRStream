@@ -47,6 +47,7 @@ if ($venvVersion -ne "3.12") {
 Push-Location $projectDirectory
 try {
     & $venvPython -m pip install --no-build-isolation .
+    & $venvPython -m asr_pipeline.model_download --config $configPath
 
     # These wheels provide the CUDA runtime used by Faster-Whisper on Windows.
     # CPU configurations do not need them.
