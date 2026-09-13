@@ -75,6 +75,27 @@ current [iptv-org public catalog](https://iptv-org.github.io/iptv/index.m3u),
 shows its channels in the same player, and transcribes the selected stream
 locally. It has no credential or tunnel dependency.
 
+### Public POC requirements
+
+- Windows 10/11 with Windows PowerShell 5.1 or PowerShell 7+
+- Python 3.12 available as `py -3.12` or `python`
+- FFmpeg available on `PATH` (or configured with `audio.ffmpeg_path`)
+- Internet access to Hugging Face for the first-run model download and to
+  iptv-org for the public channel catalog
+- Several GB of free disk space for the Large-v3 model, Python environment,
+  and cached media
+- For the checked-in CUDA configuration: an NVIDIA GPU with a current driver
+  compatible with CUDA 12; CPU mode is possible by changing the config to
+  `device = "cpu"`
+
+The launcher installs the Python dependencies and CUDA runtime wheels when
+needed. If PowerShell script execution is restricted, run it in a temporary
+process policy scope:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+```
+
 ```bash
 ./run-public-poc.sh
 ```
@@ -97,8 +118,8 @@ can be unavailable or use codecs that a browser cannot play; select another
 channel when the catalog entry cannot be packaged. The catalog is downloaded
 once to `.runtime/public-iptv/index.m3u`; later launches use that cached copy.
 
-Open `http://127.0.0.1:8080/`. The service resolves channels through the
-authenticated API, packages the selected channel locally as CMAF with AAC-LC
+Open `http://127.0.0.1:8081/`. The service resolves channels from the public
+catalog, packages the selected channel locally as CMAF with AAC-LC
 audio, and sends finalized Large-v3 segments to the subtitle overlay via SSE.
 The subtitle switch changes only display; local transcription remains active
 for the selected channel.
