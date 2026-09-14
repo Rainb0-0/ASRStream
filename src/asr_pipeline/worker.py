@@ -28,6 +28,7 @@ class WorkItem:
     start_seconds: float
     end_seconds: float
     samples: np.ndarray
+    initial_prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,7 @@ def worker_main(worker_id: int, settings: WorkerSettings, input_queue: Any, outp
                 item.samples,
                 beam_size=settings.model.beam_size,
                 vad_filter=settings.model.vad_filter,
+                initial_prompt=item.initial_prompt,
             )
             output = tuple(
                 TranscriptSegment(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
 import json
 import hashlib
 import multiprocessing as mp
@@ -14,8 +15,8 @@ import threading
 import time
 import tomllib
 from typing import Any, BinaryIO, Protocol
-from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 import numpy as np
 
@@ -79,6 +80,7 @@ class Session:
     pending: AudioWindow | None = None
     inflight_sequence: int | None = None
     next_sequence: int = 0
+    prompt_history: deque[tuple[float, str]] = field(default_factory=deque)
 
 
 @dataclass
@@ -208,6 +210,10 @@ class IptvClient:
             )
         return channels
 
+    @staticmethod
+    def resolve(channel: Channel) -> Channel:
+        return channel
+
 
 class ChannelCatalog(Protocol):
     def channels(self) -> dict[str, Channel]: ...
@@ -257,6 +263,75 @@ class PublicPlaylistClient:
                     raise RuntimeError("public IPTV playlist contains no playable channels")
             return self._channels
 
+    @staticmethod
+    def resolve(channel: Channel) -> Channel:
+        """Resolve a master playlist to a working live media playlist.
+
+        Some public CDNs redirect the master and its child playlists to
+        different edges.  FFmpeg can then remain stuck retrying an empty edge.
+        Selecting a validated child here gives the packager one stable URL.
+        """
+        for _ in range(3):
+            try:
+                with urlopen(PublicPlaylistClient._request(channel.hls_url), timeout=15) as response:
+                    master_url = PublicPlaylistClient._repair_telewebion_url(response.geturl())
+                    playlist = response.read().decode("utf-8-sig", errors="replace")
+            except Exception:
+                continue
+            variants = [
+                line.strip() for line in playlist.splitlines()
+                if line.strip() and not line.startswith("#")
+            ]
+            if "#EXT-X-STREAM-INF:" not in playlist:
+                return channel
+            for variant in variants:
+                candidate = urljoin(master_url, variant)
+                candidate = PublicPlaylistClient._repair_telewebion_url(candidate)
+                base = urlsplit(master_url)
+                child = urlsplit(candidate)
+                if base.query and not child.query:
+                    candidate = urlunsplit(child._replace(query=base.query))
+                try:
+                    with urlopen(PublicPlaylistClient._request(candidate), timeout=15) as response:
+                        resolved_url = PublicPlaylistClient._repair_telewebion_url(response.geturl())
+                        media = response.read(4096).decode("utf-8-sig", errors="replace")
+                    if "#EXTINF:" in media:
+                        segment = next(
+                            (line.strip() for line in media.splitlines()
+                             if line.strip() and not line.startswith("#")),
+                            None,
+                        )
+                        if segment is None:
+                            continue
+                        segment_url = PublicPlaylistClient._repair_telewebion_url(urljoin(resolved_url, segment))
+                        resolved_parts = urlsplit(resolved_url)
+                        segment_parts = urlsplit(segment_url)
+                        if resolved_parts.query and not segment_parts.query:
+                            segment_url = urlunsplit(segment_parts._replace(query=resolved_parts.query))
+                        with urlopen(PublicPlaylistClient._request(segment_url), timeout=15) as segment_response:
+                            if not segment_response.read(188):
+                                continue
+                        return Channel(channel.id, channel.name, resolved_url, channel.video_codec, channel.height)
+                except Exception:
+                    continue
+        raise RuntimeError(f"public HLS stream is unavailable: {channel.name}")
+
+    @staticmethod
+    def _request(url: str) -> Request:
+        return Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+    @staticmethod
+    def _repair_telewebion_url(url: str) -> str:
+        parts = urlsplit(url)
+        if not parts.hostname or not parts.hostname.endswith("telewebion.net"):
+            return url
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        if query.get("isp", "").upper() == "NA" or query.get("city", "").upper() == "NA":
+            query["isp"] = "tci"
+            query["city"] = "isfahan"
+            return urlunsplit(parts._replace(query=urlencode(query)))
+        return url
+
 
 class CaptionHub:
     def __init__(self) -> None:
@@ -290,6 +365,9 @@ class CaptionHub:
 
 class PocTranscriber:
     """Capacity-aware local workers with one independently scheduled session per channel."""
+
+    _PROMPT_HISTORY_SECONDS = 180
+    _MAX_INITIAL_PROMPT_CHARACTERS = 512
 
     def __init__(self, config: PocConfig | PublicPocConfig, captions: CaptionHub) -> None:
         self._config = config
@@ -423,7 +501,17 @@ class PocTranscriber:
         session.worker.input_queue.put(WorkItem(
             stream_id=session.internal_stream_id, sequence=session.next_sequence,
             start_seconds=window.start_seconds, end_seconds=window.end_seconds, samples=window.samples,
+            initial_prompt=self._prompt_for(session, window.start_seconds),
         ))
+
+    def _prompt_for(self, session: Session, start_seconds: float) -> str | None:
+        cutoff = start_seconds - self._PROMPT_HISTORY_SECONDS
+        while session.prompt_history and session.prompt_history[0][0] < cutoff:
+            session.prompt_history.popleft()
+        prompt = " ".join(text for _, text in session.prompt_history)
+        if not prompt:
+            return None
+        return prompt[-self._MAX_INITIAL_PROMPT_CHARACTERS:]
 
     def _drain_results(self) -> None:
         while not self._stopping.is_set():
@@ -449,6 +537,7 @@ class PocTranscriber:
                         "type": "metrics", "channel_id": session.channel.id, "rtf": rtf,
                     })
                     for segment in result.segments:
+                        session.prompt_history.append((segment.end_seconds, segment.text))
                         self._captions.publish({
                             "type": "caption", "channel_id": session.channel.id, "language": result.language,
                             "start_seconds": segment.start_seconds, "end_seconds": segment.end_seconds,
@@ -507,6 +596,9 @@ class LocalCmafPackager:
         self._media_directory = media_directory
         self._lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=40)
+        self._channel_url: str | None = None
         self._generation = 0
         self._media_directory.mkdir(parents=True, exist_ok=True)
 
@@ -523,6 +615,22 @@ class LocalCmafPackager:
             command = [
                 self._config.pipeline.audio.ffmpeg_path,
                 "-nostdin", "-hide_banner", "-loglevel", "warning",
+                # Public IPTV endpoints frequently close the HTTP connection
+                # between live HLS playlist updates.  Without these protocol
+                # options FFmpeg treats that EOF as the end of the input and
+                # finalizes our local playlist after the first few segments.
+                "-reconnect", "1", "-reconnect_streamed", "1",
+                "-reconnect_on_network_error", "1",
+                "-reconnect_delay_max", "10",
+                "-user_agent", "Mozilla/5.0",
+                # Start near the live edge.  Some public HLS servers retain
+                # old playlist entries after deleting their corresponding
+                # segments, which otherwise makes FFmpeg fail on segment one.
+                "-live_start_index", "-3",
+                # IPTV catalogs commonly use opaque, extensionless segment
+                # names (IRIB1's names are also unusually long).
+                "-allowed_extensions", "ALL",
+                "-allowed_segment_extensions", "ALL",
                 "-fflags", "+genpts+discardcorrupt", "-i", channel.hls_url,
                 "-map", "0:v:0", "-map", "0:a:0?",
                 "-c:v", "copy", "-tag:v", video_tag,
@@ -539,6 +647,15 @@ class LocalCmafPackager:
             self._process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if self._process.stdout is None:
                 raise RuntimeError("could not create local ASR audio stream")
+            self._channel_url = channel.hls_url
+            self._stderr_tail.clear()
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stderr,
+                args=(self._process.stderr, channel.name),
+                name=f"ffmpeg-log-{channel.id}",
+                daemon=True,
+            )
+            self._stderr_thread.start()
             return PackagedMedia(manifest, self._process.stdout)
 
     def await_startup_buffer(self, manifest: Path) -> None:
@@ -549,34 +666,62 @@ class LocalCmafPackager:
                 if self._has_startup_buffer(manifest):
                     return
                 if self._process.poll() is not None:
-                    error = self._process.stderr.read().decode(errors="replace") if self._process.stderr else ""
-                    raise RuntimeError(f"local CMAF packager exited ({self._process.returncode}): {error[-500:]}")
+                    raise RuntimeError(self._startup_diagnostics(manifest, "process exited"))
                 time.sleep(0.5)
+            print(f"[cmaf] startup timeout: {self._startup_diagnostics(manifest, 'no playable segment after 40s')}", file=sys.stderr)
             self._stop_locked()
-            raise RuntimeError("timed out waiting for the local CMAF playlist")
+            raise RuntimeError("timed out waiting for the local CMAF playlist; see POC log for FFmpeg diagnostics")
+
+    def _drain_stderr(self, stderr: BinaryIO | None, channel_name: str) -> None:
+        if stderr is None:
+            return
+        for raw_line in iter(stderr.readline, b""):
+            line = raw_line.decode(errors="replace").strip()
+            if line:
+                self._stderr_tail.append(line)
+                print(f"[ffmpeg:{channel_name}] {line}", file=sys.stderr)
+
+    def _startup_diagnostics(self, manifest: Path, reason: str) -> str:
+        process = self._process
+        files = sorted(path.name for path in manifest.parent.iterdir()) if manifest.parent.is_dir() else []
+        tail = " | ".join(self._stderr_tail) or "no FFmpeg stderr output"
+        return (
+            f"{reason}; url={self._channel_url}; pid={process.pid if process else None}; "
+            f"returncode={process.poll() if process else None}; files={files}; stderr={tail[-2000:]}"
+        )
 
     @staticmethod
     def _has_startup_buffer(manifest: Path) -> bool:
         if not manifest.is_file() or not (manifest.parent / "init.mp4").is_file():
             return False
-        # A single fMP4 segment is enough for HLS.js to start. Requiring a
-        # six-segment live buffer here wrongly rejects slower public streams.
-        return "#EXTINF:" in manifest.read_text()
+        durations = (
+            float(line.removeprefix("#EXTINF:").rstrip(","))
+            for line in manifest.read_text().splitlines()
+            if line.startswith("#EXTINF:")
+        )
+        # HLS.js is configured to play 12 seconds behind live. Do not start
+        # it with a single segment at the live edge, where every segment
+        # transition risks a rebuffer.
+        return sum(durations) >= 12
 
     def stop(self) -> None:
         with self._lock:
             self._stop_locked()
 
     def _stop_locked(self) -> None:
-        if self._process is None or self._process.poll() is not None:
+        if self._process is None:
             self._process = None
             return
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait(timeout=5)
+        if self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=5)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1)
+        self._stderr_thread = None
         self._process = None
 
 
@@ -600,6 +745,7 @@ class PocService:
         channel = self.channels().get(channel_id)
         if channel is None:
             raise ValueError("unknown or inactive channel")
+        channel = self.catalog.resolve(channel)
         with self._selection_lock:
             with self._playback_lock:
                 existing = self._playbacks.get(channel_id)
@@ -626,6 +772,11 @@ class PocService:
                 self.transcriber.select(channel, media.audio)
                 packager.await_startup_buffer(media.manifest_path)
             except Exception:
+                # ASR starts before CMAF startup is confirmed so the PCM pipe
+                # cannot back up.  If CMAF then fails, release that session;
+                # otherwise the next selection incorrectly allocates another
+                # GPU worker and loads a second Large-v3 model.
+                self.transcriber.stop_channels({channel.id})
                 packager.stop()
                 raise
             playback = Playback(channel, media.manifest_path, "local_cmaf")

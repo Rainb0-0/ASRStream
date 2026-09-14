@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 from contextlib import redirect_stdout
 from io import StringIO
@@ -133,6 +134,23 @@ file:///tmp/local.ts
             channels = PublicPlaylistClient(config).channels()
             self.assertEqual(next(iter(channels.values())).name, "Cached")
 
+    def test_public_master_resolves_to_live_variant_and_preserves_redirect_query(self) -> None:
+        master = "https://edge.example/live/playlist.m3u8?isp=tci"
+        with mock.patch("asr_pipeline.poc.urlopen") as open_url:
+            master_response = mock.MagicMock()
+            master_response.geturl.return_value = master
+            master_response.read.return_value = (
+                b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n240p/index.m3u8\n"
+            )
+            variant_response = mock.MagicMock()
+            variant_response.geturl.return_value = "https://live-edge.example/live/240p/index.m3u8?isp=tci"
+            variant_response.read.return_value = b"#EXTM3U\n#EXTINF:2,\nsegment.ts\n"
+            segment_response = mock.MagicMock()
+            segment_response.read.return_value = b"x" * 188
+            open_url.return_value.__enter__.side_effect = [master_response, variant_response, segment_response]
+            resolved = PublicPlaylistClient.resolve(Channel("id", "IRIB1", master, None, None))
+        self.assertEqual(resolved.hls_url, "https://live-edge.example/live/240p/index.m3u8?isp=tci")
+
 
 class PocMultichannelTests(unittest.TestCase):
     def test_caption_hub_routes_each_caption_to_its_channel(self) -> None:
@@ -171,13 +189,30 @@ class PocMultichannelTests(unittest.TestCase):
         self.assertNotIn(session.internal_stream_id, transcriber._sessions)
         self.assertNotIn(session.internal_stream_id, worker.stream_ids)
 
-    def test_cmaf_packager_accepts_first_playable_segment(self) -> None:
+    def test_prompt_uses_recent_transcript_history_for_its_channel(self) -> None:
+        transcriber = object.__new__(PocTranscriber)
+        worker = type("Worker", (), {"stream_ids": set()})()
+        session = Session(1, Channel("one", "One", "https://one.test/live", None, None), "poc-1", worker)
+        session.prompt_history.extend([(10.0, "old"), (190.0, "recent context")])
+
+        self.assertEqual(transcriber._prompt_for(session, 200.0), "recent context")
+
+    def test_cmaf_packager_waits_for_the_live_sync_buffer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             media = Path(directory)
             manifest = media / "stream.m3u8"
             (media / "init.mp4").write_bytes(b"init")
-            manifest.write_text("#EXTM3U\n#EXTINF:10,\nsegment.m4s\n")
+            manifest.write_text("#EXTM3U\n#EXTINF:6,\nfirst.m4s\n#EXTINF:6,\nsecond.m4s\n")
             self.assertTrue(LocalCmafPackager._has_startup_buffer(manifest))
+
+    def test_cmaf_packager_reconnects_when_live_http_input_closes(self) -> None:
+        command_source = Path(LocalCmafPackager.start.__code__.co_filename).read_text()
+        self.assertIn('"-reconnect", "1"', command_source)
+        self.assertIn('"-reconnect_streamed", "1"', command_source)
+        self.assertIn('"-reconnect_on_network_error", "1"', command_source)
+        self.assertIn('"-live_start_index", "-3"', command_source)
+        self.assertIn('"-allowed_extensions", "ALL"', command_source)
+        self.assertIn('"-allowed_segment_extensions", "ALL"', command_source)
 
 
 if __name__ == "__main__":
